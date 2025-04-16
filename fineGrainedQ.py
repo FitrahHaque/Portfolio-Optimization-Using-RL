@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[34]:
+# In[177]:
 
 
 # from google.colab import drive
 # drive.mount('/content/drive')
 
 
-# In[35]:
+# In[178]:
 
 
 import math
@@ -25,16 +25,17 @@ from collections import deque
 
 # ### Data Preparation
 
-# In[36]:
+# In[179]:
 
 
 # Define the 10 assets (tickers) for the portfolio
 # tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA", "BA", "NFLX", "NVDA", "META", "SBUX"]
+
 # tickers = ["AAPL", "MSFT", "GOOGL", "SBUX", "TSLA"]
 tickers = ["GME", "AMC", "SPCE", "NVAX", "NOK"]
 
 # Date range for historical data
-start_date = "2015-01-01"
+start_date = "2014-01-01"
 end_date   = "2023-12-31"
 
 # Try to load price data from a local CSV, otherwise download using yfinance
@@ -52,17 +53,63 @@ except FileNotFoundError:
     print("Data downloaded and saved to", data_file)
 
 # Split data into training (first 4 years) and testing (last year)
-train_df = prices_df[prices_df.index < "2023-01-01"]
+full_train_df = prices_df[prices_df.index < "2023-01-01"]
 test_df  = prices_df[prices_df.index >= "2023-01-01"]
-train_prices = train_df.values  # shape: [train_days, 5]
+full_train_prices = full_train_df.values  # shape: [train_days, 5]
 test_prices  = test_df.values   # shape: [test_days, 5]
-num_assets = train_prices.shape[1]
-print(f"Training days: {train_prices.shape[0]}, Testing days: {test_prices.shape[0]}")
+num_assets = full_train_prices.shape[1]
+print(f"Training days: {full_train_prices.shape[0]}, Testing days: {test_prices.shape[0]}")
+
+# Further split full training into training and validation (80/20)
+split_index = int(0.8 * full_train_prices.shape[0])
+train_prices = full_train_prices[:split_index]
+val_prices   = full_train_prices[split_index:]
+
+
+# ###  Technical Indicators & State Representation
+
+# In[180]:
+
+
+def get_market_indicators(price_array, t, window=10):
+    """
+    Compute technical indicators for each asset at time t:
+      - Moving Average Ratio: current price / moving average over window
+      - Volatility: std dev of daily returns over window (normalized by current price)
+    If not enough history exists, use current price and low volatility.
+    Returns a list of 2 values per asset.
+    """
+    indicators = []
+    for asset in range(num_assets):
+        if t < window:
+            # Not enough history: use current price and set volatility to 0
+            moving_avg_ratio = 1.0
+            vol = 0.0
+        else:
+            window_prices = price_array[t-window+1:t+1, asset]
+            moving_avg = np.mean(window_prices)
+            moving_avg_ratio = price_array[t, asset] / (moving_avg + 1e-6)
+            returns = np.diff(window_prices) / (window_prices[:-1] + 1e-6)
+            vol = np.std(returns) / (price_array[t, asset] + 1e-6)
+        indicators.extend([moving_avg_ratio, vol])
+    return indicators
+
+def get_state(t, alloc_state, price_array):
+    """
+    Constructs the state vector at time t by combining:
+      - Portfolio allocations (6 numbers: 5 assets + cash) normalized to [0,1]
+      - Market indicators for assets (2 per asset)
+    Returns a numpy array of length 6 + 10 = 16.
+    """
+    # Normalize allocation percentages (they sum to 100)
+    alloc_norm = [a / 100.0 for a in alloc_state]
+    indicators = get_market_indicators(price_array, t)
+    return np.array(alloc_norm + indicators)
 
 
 # ### State Encoding/Decoding and Actions
 
-# In[37]:
+# In[181]:
 
 
 # Construct the new action space.
@@ -142,29 +189,29 @@ def apply_action(state, action):
     # For now, assume actions are valid and state remains valid.
     return tuple(state)
 
-def compute_reward(weights_frac, price_today, price_next):
-    """
-    Compute the log return of the portfolio for one time step.
-    - weights_frac: list of 5 asset weight fractions after rebalancing on day t (sum=1).
-    - price_today: prices of the 5 assets at day t.
-    - price_next: prices of the 5 assets at day t+1.
-    Returns: log(portfolio return) from day t to t+1.
-    """
-    # Portfolio value growth factor = sum_k w_k * (price_next_k / price_today_k)
-    growth_factor = 0.0
-    for k in range(len(assets_plus_cash)):
-        if k == cash_idx:
-            ratio = 1.0
-        else:
-            ratio = price_next[k] / price_today[k]
-        growth_factor += weights_frac[k] * ratio
-    # Reward is the log of the growth factor
-    return math.log(growth_factor)
+# def compute_reward(weights_frac, price_today, price_next):
+#     """
+#     Compute the log return of the portfolio for one time step.
+#     - weights_frac: list of 5 asset weight fractions after rebalancing on day t (sum=1).
+#     - price_today: prices of the 5 assets at day t.
+#     - price_next: prices of the 5 assets at day t+1.
+#     Returns: log(portfolio return) from day t to t+1.
+#     """
+#     # Portfolio value growth factor = sum_k w_k * (price_next_k / price_today_k)
+#     growth_factor = 0.0
+#     for k in range(len(assets_plus_cash)):
+#         if k == cash_idx:
+#             ratio = 1.0
+#         else:
+#             ratio = price_next[k] / price_today[k]
+#         growth_factor += weights_frac[k] * ratio
+#     # Reward is the log of the growth factor
+#     return math.log(growth_factor)
 
 
 # ### Reward Shaping using a Rolling Sharpe Ratio
 
-# In[38]:
+# In[182]:
 
 
 class SharpeRewardShaper:
@@ -172,22 +219,59 @@ class SharpeRewardShaper:
         self.window = window
         self.rewards_history = []
         self.epsilon = epsilon
+        self.portfolio_max = -np.inf
 
-    def shape(self, raw_reward):
+    def shape(self, raw_reward, current_portfolio):
+        """
+        Enhances reward by:
+          - Computing rolling Sharpe ratio,
+          - Penalizing drawdowns (if current_portfolio is lower than past peak),
+          - Penalizing high volatility.
+        """
         self.rewards_history.append(raw_reward)
         if len(self.rewards_history) > self.window:
             self.rewards_history.pop(0)
         avg_reward = np.mean(self.rewards_history)
         std_reward = np.std(self.rewards_history) + self.epsilon
         sharpe = avg_reward / std_reward
-        return sharpe
+
+        # Update running maximum portfolio value
+        self.portfolio_max = max(self.portfolio_max, current_portfolio)
+        drawdown = (self.portfolio_max - current_portfolio) / (self.portfolio_max + self.epsilon)
+        drawdown_penalty = drawdown * 0.5  # factor can be tuned
+
+        # Volatility penalty: higher volatility (std reward) reduces reward
+        vol_penalty = std_reward * 0.5  # factor can be tuned
+
+        # Final shaped reward: encourage long term gain via n-step (raw_reward already multi-step) + penalize risks
+        shaped_reward = sharpe - drawdown_penalty - vol_penalty
+
+        return shaped_reward
+
+def compute_reward(weights_frac, price_array, t, n_step=3):
+    """
+    Compute the reward using n-step return from time t to t+n_step.
+    Growth is computed by taking the weighted sum of asset returns over n_step days.
+    If t+n_step is beyond available data, use last available day.
+    """
+    last_index = min(t + n_step, price_array.shape[0] - 1)
+    growth_factor = 0.0
+    for k in range(len(assets_plus_cash)):
+        # For cash, return is 1.0; for assets use price ratio over n steps.
+        if k == cash_idx:
+            ratio = 1.0
+        else:
+            ratio = price_array[last_index, k] / price_array[t, k]
+        growth_factor += weights_frac[k] * ratio
+    # raw reward is log of multi-step growth factor
+    return math.log(growth_factor + 1e-6)
 
 reward_shaper = SharpeRewardShaper(window=30)
 
 
 # ### Replay Buffer for Experience Replay
 
-# In[39]:
+# In[183]:
 
 
 class ReplayBuffer:
@@ -220,7 +304,7 @@ class ReplayBuffer:
 
 # ### Neural Network for Q-value Function
 
-# In[40]:
+# In[184]:
 
 
 class DQNNetwork(nn.Module):
@@ -231,14 +315,15 @@ class DQNNetwork(nn.Module):
         action_dim: number of possible actions (e.g. 21)
         """
         super(DQNNetwork, self).__init__()
-        self.fc1 = nn.Linear(state_dim, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.dropout1 = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(128, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.dropout2 = nn.Dropout(0.3)
-        self.fc3 = nn.Linear(256, 128)
-        self.fc4 = nn.Linear(128, action_dim)
+
+        # self.fc1 = nn.Linear(state_dim, 128)
+        # self.bn1 = nn.BatchNorm1d(128)
+        # self.dropout1 = nn.Dropout(0.3)
+        # self.fc2 = nn.Linear(128, 256)
+        # self.bn2 = nn.BatchNorm1d(256)
+        # self.dropout2 = nn.Dropout(0.3)
+        # self.fc3 = nn.Linear(256, 128)
+        # self.fc4 = nn.Linear(128, action_dim)
 
         # hidden1 = 128
         # hidden2 = 128
@@ -246,46 +331,60 @@ class DQNNetwork(nn.Module):
         # self.fc2 = nn.Linear(hidden1, hidden2)
         # self.fc3 = nn.Linear(hidden2, action_dim)
 
+        self.fc1 = nn.Linear(state_dim, 128)
+        self.ln1 = nn.LayerNorm(128)
+        self.dropout1 = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(128, 256)
+        self.ln2 = nn.LayerNorm(256)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc3 = nn.Linear(256, 128)
+        self.fc4 = nn.Linear(128, action_dim)
 
     def forward(self, x):
         # x is a tensor of shape [batch_size, state_dim]
 
-        x = F.relu(self.bn1(self.fc1(x)))
-        x = self.dropout1(x)
-        x = F.relu(self.bn2(self.fc2(x)))
-        x = self.dropout2(x)
-        x = F.relu(self.fc3(x))
-        q_vals = self.fc4(x)
-        return q_vals
+        # x = F.relu(self.bn1(self.fc1(x)))
+        # x = self.dropout1(x)
+        # x = F.relu(self.bn2(self.fc2(x)))
+        # x = self.dropout2(x)
+        # x = F.relu(self.fc3(x))
+        # q_vals = self.fc4(x)
 
         # x = F.relu(self.fc1(x))
         # x = F.relu(self.fc2(x))
         # q_values = self.fc3(x)  # outputs Q-values for each action
-        # return q_values
+
+        x = F.relu(self.ln1(self.fc1(x)))
+        x = self.dropout1(x)
+        x = F.relu(self.ln2(self.fc2(x)))
+        x = self.dropout2(x)
+        x = F.relu(self.fc3(x))
+        q_vals = self.fc4(x)
+
+        return q_vals
 
 
 # ### DQN Agent Training Setup
 
-# In[ ]:
+# In[185]:
 
 
 # Hyperparameters
-gamma = 0.99            # discount factor for future rewards
-learning_rate = 5e-4  # learning rate for optimizer
-epsilon_start = 1.0     # initial exploration rate
-epsilon_min   = 0.2     # minimum exploration rate
-epsilon_decay = 0.995    # multiplicative decay factor per episode
-episodes = 150          # number of training episodes
-batch_size = 128         # mini-batch size for replay updates
-target_update_freq = 5 # how often (in episodes) to update the target network
-replay_capacity = 10000 # capacity of the replay buffer
+# gamma = 0.99            # discount factor for future rewards
+# learning_rate = 5e-4  # learning rate for optimizer
+# epsilon_start = 1.0     # initial exploration rate
+# epsilon_min   = 0.2     # minimum exploration rate
+# epsilon_decay = 0.995    # multiplicative decay factor per episode
+# episodes = 150          # number of training episodes
+# batch_size = 128         # mini-batch size for replay updates
+# target_update_freq = 5 # how often (in episodes) to update the target network
+# replay_capacity = 10000 # capacity of the replay buffer
 use_double_dqn = True  # use Double DQN for      
-state_dim = num_assets + 1  # 5 assets + cash
-action_dim = action_count 
-ensemble_size = 2
-
+state_dim = num_assets + 1 + num_assets * 2  # 6 (allocations) + 10 (2 indicators per each of the 5 assets) = 16
+# ensemble_size = 2
+# temperature = 1.0
+initial_state=(15, 15, 15, 15, 15, 25)
 # Initialize replay memory, policy network, target network, optimizer
-replay_buffer = ReplayBuffer(replay_capacity)
 # prioritized_replay_buffer = PrioritizedReplayBuffer(replay_capacity)
 
 # policy_net = DQNNetwork(state_dim, action_dim)
@@ -296,30 +395,30 @@ replay_buffer = ReplayBuffer(replay_capacity)
 # optimizer = optim.Adam(policy_net.parameters(), lr=learning_rate)
 
 
-# Create ensemble of networks and their corresponding target networks
-ensemble_nets = [DQNNetwork(state_dim, action_dim) for _ in range(ensemble_size)]
-ensemble_targets = [DQNNetwork(state_dim, action_dim) for _ in range(ensemble_size)]
-for net, target in zip(ensemble_nets, ensemble_targets):
-    target.load_state_dict(net.state_dict())
-    target.eval()
-# Combine parameters of all ensemble networks in one optimizer
-ensemble_optimizer = optim.Adam([p for net in ensemble_nets for p in net.parameters()], lr=learning_rate)
+# # Create ensemble of networks and their corresponding target networks
+# ensemble_nets = [DQNNetwork(state_dim, action_count) for _ in range(ensemble_size)]
+# ensemble_targets = [DQNNetwork(state_dim, action_count) for _ in range(ensemble_size)]
+# for net, target in zip(ensemble_nets, ensemble_targets):
+#     target.load_state_dict(net.state_dict())
+#     target.eval()
+# # Combine parameters of all ensemble networks in one optimizer
+# ensemble_optimizer = optim.Adam([p for net in ensemble_nets for p in net.parameters()], lr=learning_rate)
 
 # For action selection and training, we take the average Q-values across ensemble members.
-def ensemble_q_values(state_input):
+def ensemble_q_values(state_input, nets):
     # Temporarily store the training state of each network.
-    original_modes = [net.training for net in ensemble_nets]
+    original_modes = [net.training for net in nets]
 
     # Switch networks to eval mode for inference (to avoid BN issues with batch size 1)
-    for net in ensemble_nets:
+    for net in nets:
         net.eval()
 
     # Compute Q-values from each network and average them
-    q_vals_list = [net(state_input) for net in ensemble_nets]  # shape: [ensemble_size, batch, action_dim]
+    q_vals_list = [net(state_input) for net in nets]  # shape: [ensemble_size, batch, action_dim]
     avg_q_vals = torch.stack(q_vals_list, dim=0).mean(dim=0)
 
     # Restore the original training mode of each network
-    for net, mode in zip(ensemble_nets, original_modes):
+    for net, mode in zip(nets, original_modes):
         if mode:
             net.train()
         else:
@@ -327,12 +426,14 @@ def ensemble_q_values(state_input):
 
     return avg_q_vals
 
-# Helper function: select action using epsilon-greedy policy
-def select_action(state, epsilon):
+# Helper function: select action
+def select_action(state, t, train_prices, epsilon, nets, temperature = 1.0):
     """
-    Choose an action using epsilon-greedy strategy for the new state/action format.
-    - state: current state as a tuple of 6 integers (sum to 100).
-    - epsilon: current exploration rate.
+    Hybrid exploration:
+      - With probability epsilon, choose a random valid action.
+      - Otherwise, use Boltzmann sampling (softmax over Q-values for valid actions).
+    The state passed in is the portfolio allocation (tuple of 6 ints).
+    We combine it with market indicators computed from price_array at time t.
     Returns: (action_idx, action_tuple)
     """
     valid_actions = get_valid_actions(state)
@@ -342,178 +443,370 @@ def select_action(state, epsilon):
     else:
         # Exploitation: choose best action according to Q-network
         # Normalize state: now state values are percentages out of 100
-        state_input = torch.FloatTensor([inc/100.0 for inc in state]).unsqueeze(0)
+        state_vec = get_state(t, state, train_prices)
+        state_tensor = torch.FloatTensor(state_vec).unsqueeze(0)
         with torch.no_grad():
-          q_values = ensemble_q_values(state_input)  # shape [1, action_dim]
-          q_values = q_values.numpy().squeeze()  # shape [action_dim]
+          q_values = ensemble_q_values(state_tensor, nets)  # shape [1, action_count]
+          q_values = q_values.numpy().squeeze()  # shape [action_count]
         # Mask out invalid actions by setting their Q-value very low
         # (So they won't be chosen as max)
         invalid_actions = set(all_actions) - set(valid_actions)
         for act in invalid_actions:
             # if act in action_to_index:
             q_values[action_to_index[act]] = -1e9  # large negative to disable
-        best_idx = int(np.argmax(q_values))
-        action = all_actions[best_idx]
+        # Boltzmann (softmax) sampling over valid Q-values
+        # exp_q = np.exp(q_values / temperature)
+        q_values -= np.max(q_values)
+        exp_q = np.exp(q_values / temperature)
+        # Zero out probabilities for invalid actions
+        for act in invalid_actions:
+            exp_q[action_to_index[act]] = 0.0
+        probs = exp_q / (np.sum(exp_q) + 1e-9)
+        action_idx = np.random.choice(len(probs), p=probs)
+        action = all_actions[action_idx]
 
     # Return both the index and the tuple representation
     return action_to_index[action], action
 
-# Training loop
-# Use the new state representation: (stock1, stock2, stock3, stock4, stock5, cash)
-# For instance, an equal weight in stocks (15% each) and 25% cash:
-initial_state = (15, 15, 15, 15, 15, 25)
-epsilon = epsilon_start
-train_days = train_prices.shape[0]
-for ep in range(1, episodes+1):
+def evaluate_on_validation(val_prices, ensemble_nets, initial_state):
+    """
+    Runs the greedy policy defined by ensemble_nets on val_prices,
+    returns the log of the final portfolio value (i.e. validation 'reward').
+    """
+    val_portfolio = 1.0
     state = initial_state
-    # Iterate over each day in training data (except last, as we look ahead one day for reward)
-    for t in range(train_days - 1):
-        # Choose action (epsilon-greedy)
-        action_idx, action = select_action(state, epsilon)
-        # Apply action to get new state
-        new_state = apply_action(state, action)
-        # Compute reward from day t to t+1
-        weights_new = [x/100.0 for x in new_state]  # convert increments to fractions
-        reward = compute_reward(weights_new, train_prices[t], train_prices[t+1])
-        reward = reward_shaper.shape(reward)
 
-        # Check if we've reached the end of an episode (done flag)
-        done = (t == train_days - 2)  # True if next_state will be the last state of episode
-        # Store the transition in replay memory
-        replay_buffer.push(state, action_idx, reward, new_state, done)
-        # prioritized_replay_buffer.add((state, action_idx, reward, new_state, done), priority=1.0)
+    for t in range(val_prices.shape[0] - 1):
+        # build state + indicators
+        inp = get_state(t, state, val_prices)
+        inp_t = torch.FloatTensor(inp).unsqueeze(0)
+        with torch.no_grad():
+            q_vals = ensemble_q_values(inp_t, ensemble_nets).numpy().squeeze()
 
-        # Update state
-        state = new_state
-        # # Perform a learning step if we have enough samples
-        if len(replay_buffer) >= batch_size:
-            # Sample a batch of transitions
-            states_batch, actions_batch, rewards_batch, next_states_batch, dones_batch = replay_buffer.sample(batch_size)
+        # mask invalid actions
+        valid = set(get_valid_actions(state))
+        for act in set(all_actions) - valid:
+            q_vals[action_to_index[act]] = -1e9
 
-            # Convert to tensors
-            # State and next state inputs as batch_size x 5 tensors (normalize allocations to [0,1])
-            state_tensor = torch.FloatTensor([ [x/100.0 for x in s] for s in states_batch ])
-            next_state_tensor = torch.FloatTensor([ [x/100.0 for x in s] for s in next_states_batch ])
-            action_tensor = torch.LongTensor(actions_batch)
-            reward_tensor = torch.FloatTensor(rewards_batch)
-            done_tensor   = torch.BoolTensor(dones_batch)
+        # take the greedy action
+        best_idx = int(np.argmax(q_vals))
+        state = apply_action(state, all_actions[best_idx])
 
-            # Compute current Q values for each state-action in the batch
-            # policy_net(state_tensor) has shape [batch, action_dim]; gather along actions
-            q_values = ensemble_q_values(state_tensor)  # [batch, action_count]
-            state_action_values = q_values.gather(1, action_tensor.unsqueeze(1)).squeeze(1)
-            # Compute target Q values using target network
-            with torch.no_grad():
-                # next_q_values = target_net(next_state_tensor)  # [batch, action_count]
-                if use_double_dqn:
-                    # Step 1: For each next_state, select the best action using the online network
-                    # Online ensemble selects best action:
-                    online_next_q = ensemble_q_values(next_state_tensor)  # avg Q from ensemble networks
-                    best_actions = online_next_q.argmax(dim=1, keepdim=True)  # best action indices from online net
-                    # Step 2: Evaluate these actions using the target network
-                    # For evaluation, take average target Q from target ensemble
-                    q_vals_targets_list = []
-                    for target_net in ensemble_targets:
-                        q_vals_targets_list.append(target_net(next_state_tensor))
-                    target_next_q = torch.stack(q_vals_targets_list).mean(dim=0)
-                    selected_q = target_next_q.gather(1, best_actions).squeeze(1)
-                else:
-                    # Standard DQN target: use the max Q-value from the target network directly
-                    q_vals_targets_list = []
-                    for target_net in ensemble_targets:
-                        q_vals_targets_list.append(target_net(next_state_tensor))
-                    target_next_q = torch.stack(q_vals_targets_list).mean(dim=0)
-                    selected_q = target_next_q.max(dim=1)[0]
+        # update portfolio
+        w = [x/100 for x in state]
+        growth = sum(
+            w[k] * (val_prices[t+1][k] / val_prices[t][k])
+            if k < num_assets else w[cash_idx]
+            for k in range(len(assets_plus_cash))
+        )
+        val_portfolio *= growth
 
-            selected_q = selected_q * (1 - done_tensor.float())
-            target_values = reward_tensor + gamma * selected_q
+    return math.log(val_portfolio)
 
-            # target_tensor = torch.FloatTensor(target_values)
-            # losses = F.smooth_l1_loss(state_action_values, target_values, reduction='none')
-            # loss = (losses * torch.FloatTensor(weights)).mean() if 'weights' in locals() else losses.mean()
-            # loss = losses.mean()
-            # Optimize the model: MSE loss between state_action_values and target_values
-            loss = F.mse_loss(state_action_values, target_values)
 
-            ensemble_optimizer.zero_grad()
-            loss.backward()
-            ensemble_optimizer.step()
+# In[186]:
 
-    # Decay epsilon after each episode
-    epsilon = max(epsilon * epsilon_decay, epsilon_min)
-    # Update target network periodically
-    if ep % target_update_freq == 0:
-        for net, target in zip(ensemble_nets, ensemble_targets):
-            target.load_state_dict(net.state_dict())
-    if ep % 10 == 0 or ep == episodes:
-        print(f"Episode {ep}/{episodes} completed, epsilon={epsilon:.3f}")
-print("Training completed.")
+
+def train_agent(episodes=150, 
+                replay_capacity=10000, 
+                batch_size=128, 
+                gamma=0.99, 
+                learning_rate=5e-4, 
+                epsilon_start=1.0, 
+                epsilon_min=0.2, 
+                epsilon_decay=0.995, 
+                target_update_freq=5, 
+                n_step_return=5, 
+                val_interval=10,
+                max_patience=5,
+                initial_state=initial_state):
+    """
+    Runs the training loop for one experiment.
+    Returns:
+       - ensemble_nets: the trained ensemble networks (list)
+       - best_val_reward: best validation reward achieved (float)
+       - train_metrics: (optional) dictionary containing additional training metrics
+    """
+
+    # Reset initial state and replay buffer
+    replay_buffer = ReplayBuffer(replay_capacity)
+    epsilon = epsilon_start
+    train_days = train_prices.shape[0]
+
+    best_val_reward = -np.inf
+    patience = 0
+    best_ensemble_nets = None
+
+    # initialize ensemble networks and target networks for each experiment
+    ensemble_size = 2
+    ensemble_nets = [DQNNetwork(state_dim, action_count) for _ in range(ensemble_size)]
+    ensemble_targets = [DQNNetwork(state_dim, action_count) for _ in range(ensemble_size)]
+    for net, target in zip(ensemble_nets, ensemble_targets):
+        target.load_state_dict(net.state_dict())
+        target.eval()
+    ensemble_optimizer = optim.Adam([p for net in ensemble_nets for p in net.parameters()], lr=learning_rate)
+
+    # Training loop
+    for ep in range(1, episodes + 1):
+        state = initial_state
+        portfolio_value = 1.0  # start with $1.0
+
+        # Iterate over each day (using train_prices, market indicators available from train_prices)
+        for t in range(0, train_days - 1 - n_step_return):
+            # Hybrid action selection: uses current day t and train_prices for market indicators
+            action_idx, action = select_action(state, t, train_prices, epsilon, ensemble_nets)
+            new_state = apply_action(state, action)
+
+            # Compute reward using n-step return
+            weights_new = [x/100.0 for x in new_state]
+            raw_reward = compute_reward(weights_new, train_prices, t, n_step=n_step_return)
+            portfolio_value *= math.exp(raw_reward)  # simulate n-step portfolio growth
+
+            # Shape reward using Sharpe reward shaper (with drawdown & volatility penalty)
+            reward = reward_shaper.shape(raw_reward, portfolio_value)
+            done = (t >= train_days - n_step_return - 1)
+
+            # Construct state representations (augmenting with market indicators)
+            state_repr = get_state(t, state, train_prices)
+            next_state_repr = get_state(t + n_step_return, new_state, train_prices)
+            replay_buffer.push(state_repr, action_idx, reward, next_state_repr, done)
+
+            state = new_state
+
+            # Learning step
+            if len(replay_buffer) >= batch_size:
+                state_reprs_batch, actions_batch, rewards_batch, next_state_reprs_batch, dones_batch = replay_buffer.sample(batch_size)
+                state_vec_tensor = torch.FloatTensor(np.array(state_reprs_batch))
+                next_state_vec_tensor = torch.FloatTensor(np.array(next_state_reprs_batch))
+                action_tensor = torch.LongTensor(actions_batch)
+                reward_tensor = torch.FloatTensor(rewards_batch)
+                done_tensor   = torch.BoolTensor(dones_batch)
+
+                # Compute current Q-values for each state in the batch using ensemble
+                q_values = ensemble_q_values(state_vec_tensor, ensemble_nets)
+                state_action_values = q_values.gather(1, action_tensor.unsqueeze(1)).squeeze(1)
+
+                # Compute target Q-values using target ensemble networks
+                with torch.no_grad():
+                    if use_double_dqn:
+                        online_next_q = ensemble_q_values(next_state_vec_tensor, ensemble_nets)
+                        best_actions = online_next_q.argmax(dim=1, keepdim=True)
+                        q_vals_targets_list = [target(next_state_vec_tensor) for target in ensemble_targets]
+                        target_next_q = torch.stack(q_vals_targets_list).mean(dim=0)
+                        selected_q = target_next_q.gather(1, best_actions).squeeze(1)
+                    else:
+                        # target_next_q = ensemble_q_values(next_state_vec_tensor, ensemble_targets)
+                        q_vals_targets_list = [target(next_state_vec_tensor) for target in ensemble_targets]
+                        target_next_q = torch.stack(q_vals_targets_list).mean(dim=0)
+                        selected_q = target_next_q.max(dim=1)[0]
+                selected_q = selected_q * (1 - done_tensor.float())
+                target_values = reward_tensor + gamma * selected_q
+
+                loss = F.mse_loss(state_action_values, target_values)
+                ensemble_optimizer.zero_grad()
+                loss.backward()
+                ensemble_optimizer.step()
+
+        # Decay epsilon after each episode
+        epsilon = max(epsilon * epsilon_decay, epsilon_min)
+        # Update target networks periodically
+        if ep % target_update_freq == 0:
+            for net, target in zip(ensemble_nets, ensemble_targets):
+                target.load_state_dict(net.state_dict())
+
+        # Evaluate on the validation set every val_interval episodes for early stopping.
+        if ep % val_interval == 0:
+            val_reward = evaluate_on_validation(val_prices, ensemble_nets, initial_state)
+            print(f"[Ep {ep}]  val={val_reward:.4f}  best={best_val_reward:.4f} epsilon={epsilon:.3f}")
+
+            # 1) Early stopping: compare to best_val_reward
+            if val_reward > best_val_reward:
+                best_val_reward = val_reward
+                patience = 0
+                best_ensemble_nets = ensemble_nets
+                print("  ↳ new best! checkpointing ensemble")
+            else:
+                patience += 1
+                print(f"  ↳ no improvement over last ({patience}/{max_patience})")
+                if patience >= max_patience:
+                    print(f"Early stopping at episode {ep} (no improvement for {max_patience} checks)")
+                    break
+
+    print("Training completed.")
+    return ensemble_nets
+
+
+# In[187]:
+
+
+def run_experiments(n_experiments=5, **train_params):
+    """
+    Runs the entire training process for n experiments and prints a summary.
+    Returns a list of (trained_ensemble, best_val_reward) tuples from each experiment.
+    """
+    trained_models = []
+    for i in range(n_experiments):
+        print("Starting experiment", i+1)
+        trained_ensemble = train_agent(**train_params)
+        trained_models.append(trained_ensemble)
+    return trained_models
+
+models = run_experiments(n_experiments=1, episodes=150)
 
 
 # ### Policy Evaluation on Test Data
 
-# In[46]:
+# In[ ]:
 
 
-def evaluate_policy(price_array, model, initial_state):
+def evaluate_policy(price_array, model, initial_state, runs=1):
     """
-    Simulate the portfolio value over time on given price data using the provided model (greedy policy).
-    Returns a list of portfolio values for each day in the price data.
+    Evaluate the policy by simulating the portfolio over time using a greedy (deterministic) policy.
+    It runs the simulation multiple times (default 10), computes key metrics for each run, and returns
+    the best simulation (based on the final portfolio value). Key metrics include:
+      - Final portfolio value and return (%)
+      - Annualized Sharpe ratio (computed from daily returns)
+      - Maximum drawdown
+    Also computes baseline (buy-and-hold) performance for comparison.
+
+    Parameters:
+      price_array: numpy array of asset prices.
+      model: the trained DQN model (or ensemble function) used for Q-value prediction.
+      initial_state: initial portfolio allocation (tuple of 6 integers).
+      runs: number of simulation runs.
+
+    Returns:
+      best_values: best portfolio value time series (list of portfolio values for each day).
+      best_metrics: dictionary of metrics for the best run.
+      baseline_value: final portfolio value using baseline (buy-and-hold equal weights).
+      baseline_return: baseline return in %.
+      all_metrics: list of metric dictionaries for each run.
     """
+
+    best_values = None
+    best_final_value = -np.inf
+    best_metrics = {}
+    all_metrics = []
+
+    # Run the simulation multiple times
+    for run in range(runs):
+        days = price_array.shape[0]
+        state = initial_state
+        portfolio_value = 1.0  # Start with $1.0
+        values = [portfolio_value]
+        daily_returns = []  # for Sharpe ratio computation
+
+        for t in range(days - 1):
+            # Get the state vector (which includes allocations and market indicators)
+            state_input = get_state(t, state, price_array)
+            state_tensor = torch.FloatTensor(state_input).unsqueeze(0)
+
+            # Predict Q-values for the current state
+            with torch.no_grad():
+                q_vals = ensemble_q_values(state_tensor, model).numpy().squeeze()
+
+            # Mask out invalid actions
+            valid_acts = get_valid_actions(state)
+            invalid_acts = set(all_actions) - set(valid_acts)
+            for act in invalid_acts:
+                q_vals[action_to_index[act]] = -1e9
+
+            best_act_idx = int(np.argmax(q_vals))
+            best_action = all_actions[best_act_idx]
+
+            # Rebalance portfolio based on the chosen action
+            state = apply_action(state, best_action)
+
+            # Compute portfolio growth factor for day t to t+1
+            weights = [x / 100.0 for x in state]
+            growth_factor = sum([
+                weights[k] * (price_array[t+1][k] / price_array[t][k])
+                if k < num_assets else weights[cash_idx]
+                for k in range(len(assets_plus_cash))
+            ])
+            portfolio_value *= growth_factor
+            values.append(portfolio_value)
+            daily_returns.append(growth_factor - 1)  # daily return (excess return if risk-free rate is 0)
+
+        # Final return in percentage terms
+        final_return = (portfolio_value - 1.0) * 100.0
+
+        # Compute Sharpe ratio: mean daily return / std daily return * sqrt(252)
+        mean_daily = np.mean(daily_returns)
+        std_daily = np.std(daily_returns) if np.std(daily_returns) > 0 else 1e-6
+        sharpe_ratio = mean_daily / std_daily * np.sqrt(price_array.shape[0])
+        # Compute maximum drawdown
+        values_array = np.array(values)
+        peak = np.maximum.accumulate(values_array)
+        drawdown = (peak - values_array) / peak
+        max_drawdown = np.max(drawdown)
+
+        metrics = {
+            'final_portfolio_value': portfolio_value,
+            'final_return': final_return,
+            'sharpe_ratio': sharpe_ratio,
+            'max_drawdown': max_drawdown
+        }
+        all_metrics.append(metrics)
+
+        # Update best run based on final portfolio value
+        if portfolio_value > best_final_value:
+            best_final_value = portfolio_value
+            best_values = values
+            best_metrics = metrics
+
+    # Baseline evaluation: Buy-and-hold with equal weights for assets (cash remains unaltered)
     days = price_array.shape[0]
-    state = initial_state
-    portfolio_value = 1.0  # start with $1.0
-    values = [portfolio_value]
-
+    baseline_value = 1.0
+    baseline_weights = [1.0 / num_assets] * num_assets  # equal weights on assets
+    baseline_shares = [baseline_weights[i] * baseline_value / price_array[0][i] for i in range(num_assets)]
+    # Assuming no rebalancing, simulate value appreciation over time
     for t in range(days - 1):
-        # Agent action: choose greedy (highest Q) action for current state
-        state_input = torch.FloatTensor([x /100.0 for x in state]).unsqueeze(0)
-        with torch.no_grad():
-            ensemble_qs = model(state_input)
-            q_vals = ensemble_qs.numpy().squeeze()
-        # Mask invalid actions for current state
-        valid_acts = get_valid_actions(state)
-        invalid_acts = set(all_actions) - set(valid_acts)
-        for act in invalid_acts:
-            # if act in action_to_index:
-            q_vals[action_to_index[act]] = -1e9
-        best_act_idx = int(np.argmax(q_vals))
-        best_action = all_actions[best_act_idx]
-        # Rebalance portfolio according to best action
-        state = apply_action(state, best_action)
-        # Compute portfolio growth factor from day t to t+1 for agent
-        weights = [x / 100.0 for x in state]
-        # growth_factor = 0.0
-        # for k in range(num_assets):
-        #     growth_factor += weights[k] * (price_array[t+1][k] / price_array[t][k])
-        growth_factor = sum([weights[k] * (price_array[t+1][k] / price_array[t][k]) for k in range(num_assets)]) + weights[cash_idx]
-        portfolio_value *= growth_factor
-        values.append(portfolio_value)
-        # Update baseline value (its shares just appreciate with market, no rebalance)
-        # Baseline (buy-and-hold equal weights) for comparison
-        baseline_value = 1.0
-        # Compute initial shares for baseline (with equal weights)
-        baseline_weights = [0.2] * num_assets  # 20% each
-        baseline_shares = [baseline_weights[i] * baseline_value / price_array[0][i] for i in range(num_assets)]
         baseline_portfolio_val = 0.0
         for k in range(num_assets):
             baseline_portfolio_val += baseline_shares[k] * price_array[t+1][k]
         baseline_value = baseline_portfolio_val
-    final_return = (portfolio_value - 1.0) * 100.0 # in %
     baseline_return = (baseline_value - 1.0) * 100.0
-    # After iterating, 'values' list contains portfolio value from start to end of period
-    print(f"Test period: Agent final portfolio value = {portfolio_value:.4f} (Return = {final_return:.2f}%)")
-    print(f"Test period: Baseline final value = {baseline_value:.4f} (Return = {baseline_return:.2f}%)")
-    return values, baseline_weights
 
-# Evaluate the trained model on test data
-agent_values, baseline_weights = evaluate_policy(test_prices, ensemble_q_values, initial_state)
+    print("Best simulation metrics:")
+    print(f"  Final portfolio value: {best_metrics['final_portfolio_value']:.4f}")
+    print(f"  Return: {best_metrics['final_return']:.2f}%")
+    print(f"  Annualized Sharpe ratio: {best_metrics['sharpe_ratio']:.4f}")
+    print(f"  Maximum drawdown: {best_metrics['max_drawdown']:.2%}")
+    print()
+    print(f"Baseline portfolio value: {baseline_value:.4f}")
+    print(f"  Return: {baseline_return:.2f}%")
+
+    return best_values, best_metrics, baseline_value, baseline_return, all_metrics
 
 
 # In[ ]:
 
 
+# Run evaluation on the test prices using the ensemble Q-value network function (or your model)
+results = {
+    'final_portfolio_value': -np.inf,
+    'final_return': 0.0,
+    'sharpe_ratio': 0.0,
+    'max_drawdown': 0.0,
+    'baseline_value': 0.0,
+}
+for model in models:
+    print("Evaluating model...")
+    agent_values, agent_metrics, baseline_value, baseline_return, all_run_metrics = evaluate_policy(test_prices, model, initial_state, 10)
+    if results['final_portfolio_value'] < agent_metrics['final_portfolio_value']:
+        results = agent_metrics
+    print("Evaluation completed.")
+    print()
 
+print("Final evaluation results:")
+print(f"    Final portfolio value: {results['final_portfolio_value']:.4f}")
+print(f"    Final return: {results['final_return']:.2f}%")
+print(f"    Annualized Sharpe ratio: {results['sharpe_ratio']:.4f}")
+print(f"    Maximum drawdown: {results['max_drawdown']:.2%}")
+print()
+print(f"Baseline portfolio value: {baseline_value:.4f}")
+print(f"  Return: {baseline_return:.2f}%")
 
 
 # In[ ]:
