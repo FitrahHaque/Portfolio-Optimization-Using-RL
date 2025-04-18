@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# In[177]:
+# In[210]:
 
 
 # from google.colab import drive
 # drive.mount('/content/drive')
 
 
-# In[178]:
+# In[211]:
 
 
 import math
@@ -25,7 +25,7 @@ from collections import deque
 
 # ### Data Preparation
 
-# In[179]:
+# In[212]:
 
 
 # Define the 10 assets (tickers) for the portfolio
@@ -33,9 +33,10 @@ from collections import deque
 
 # tickers = ["AAPL", "MSFT", "GOOGL", "SBUX", "TSLA"]
 tickers = ["GME", "AMC", "SPCE", "NVAX", "NOK"]
-
+# tickers = ["GME", "AMC", "BB", "NVAX", "NOK"]
+# tickers = ["GME", "AMC", "HMC", "NVAX", "NOK"]
 # Date range for historical data
-start_date = "2014-01-01"
+start_date = "2017-01-01"
 end_date   = "2023-12-31"
 
 # Try to load price data from a local CSV, otherwise download using yfinance
@@ -68,7 +69,7 @@ val_prices   = full_train_prices[split_index:]
 
 # ###  Technical Indicators & State Representation
 
-# In[180]:
+# In[213]:
 
 
 def get_market_indicators(price_array, t, window=10):
@@ -109,7 +110,7 @@ def get_state(t, alloc_state, price_array):
 
 # ### State Encoding/Decoding and Actions
 
-# In[181]:
+# In[214]:
 
 
 # Construct the new action space.
@@ -174,14 +175,12 @@ def apply_action(state, action):
         return tuple(state)
     src, dst, amt = action
     # If src is not cash, reduce its allocation by amt (clip at 0)
-    if src is not None and src != cash_idx and state[src] >= amt:
+    if src is not None and state[src] >= amt:
         state[src] = state[src] - amt
     # If dst is not cash, increase its allocation by amt (clip at 100)
     if dst is not None and dst != cash_idx and state[dst] + amt <= 100:
         state[dst] = state[dst] + amt
-    # If src is cash, subtract amt from cash, if dst is cash, add amt to cash.
-    if src == cash_idx:
-        state[cash_idx] = state[cash_idx] - amt
+    # If dst is cash, add amt to cash.
     if dst == cash_idx:
         state[cash_idx] = state[cash_idx] + amt
     # Optionally, enforce that the new state's sum remains 100. Here, if clipping occurred,
@@ -211,7 +210,7 @@ def apply_action(state, action):
 
 # ### Reward Shaping using a Rolling Sharpe Ratio
 
-# In[182]:
+# In[215]:
 
 
 class SharpeRewardShaper:
@@ -264,14 +263,14 @@ def compute_reward(weights_frac, price_array, t, n_step=3):
             ratio = price_array[last_index, k] / price_array[t, k]
         growth_factor += weights_frac[k] * ratio
     # raw reward is log of multi-step growth factor
-    return math.log(growth_factor + 1e-6)
+    return math.log(growth_factor+1e-6)
 
 reward_shaper = SharpeRewardShaper(window=30)
 
 
 # ### Replay Buffer for Experience Replay
 
-# In[183]:
+# In[216]:
 
 
 class ReplayBuffer:
@@ -304,7 +303,7 @@ class ReplayBuffer:
 
 # ### Neural Network for Q-value Function
 
-# In[184]:
+# In[217]:
 
 
 class DQNNetwork(nn.Module):
@@ -366,7 +365,7 @@ class DQNNetwork(nn.Module):
 
 # ### DQN Agent Training Setup
 
-# In[185]:
+# In[ ]:
 
 
 # Hyperparameters
@@ -456,12 +455,17 @@ def select_action(state, t, train_prices, epsilon, nets, temperature = 1.0):
             q_values[action_to_index[act]] = -1e9  # large negative to disable
         # Boltzmann (softmax) sampling over valid Q-values
         # exp_q = np.exp(q_values / temperature)
-        q_values -= np.max(q_values)
+        q_values = np.nan_to_num(q_values)  # replace NaN with 0
+        q_values -= q_values.max()  # for numerical stability
         exp_q = np.exp(q_values / temperature)
         # Zero out probabilities for invalid actions
         for act in invalid_actions:
             exp_q[action_to_index[act]] = 0.0
-        probs = exp_q / (np.sum(exp_q) + 1e-9)
+        total = exp_q.sum()
+        if total <= 0 or np.isnan(total):
+            best_idx = int(np.nnanargmax(q_values))
+            return best_idx, all_actions[best_idx]
+        probs = exp_q / total
         action_idx = np.random.choice(len(probs), p=probs)
         action = all_actions[action_idx]
 
@@ -501,10 +505,10 @@ def evaluate_on_validation(val_prices, ensemble_nets, initial_state):
         )
         val_portfolio *= growth
 
-    return math.log(val_portfolio)
+    return math.log(val_portfolio + 1e-6)
 
 
-# In[186]:
+# In[219]:
 
 
 def train_agent(episodes=150, 
@@ -617,7 +621,7 @@ def train_agent(episodes=150,
         # Evaluate on the validation set every val_interval episodes for early stopping.
         if ep % val_interval == 0:
             val_reward = evaluate_on_validation(val_prices, ensemble_nets, initial_state)
-            print(f"[Ep {ep}]  val={val_reward:.4f}  best={best_val_reward:.4f} epsilon={epsilon:.3f}")
+            print(f"[Ep {ep}/{episodes}]  val={val_reward:.4f}  best={best_val_reward:.4f} epsilon={epsilon:.3f}")
 
             # 1) Early stopping: compare to best_val_reward
             if val_reward > best_val_reward:
@@ -636,7 +640,7 @@ def train_agent(episodes=150,
     return ensemble_nets
 
 
-# In[187]:
+# In[220]:
 
 
 def run_experiments(n_experiments=5, **train_params):
@@ -651,7 +655,7 @@ def run_experiments(n_experiments=5, **train_params):
         trained_models.append(trained_ensemble)
     return trained_models
 
-models = run_experiments(n_experiments=1, episodes=150)
+models = run_experiments(n_experiments=10, episodes=200)
 
 
 # ### Policy Evaluation on Test Data
@@ -756,6 +760,34 @@ def evaluate_policy(price_array, model, initial_state, runs=1):
             best_metrics = metrics
 
     # Baseline evaluation: Buy-and-hold with equal weights for assets (cash remains unaltered)
+    # days = price_array.shape[0]
+    # baseline_value = 1.0
+    # baseline_weights = [1.0 / num_assets] * num_assets  # equal weights on assets
+    # baseline_shares = [baseline_weights[i] * baseline_value / price_array[0][i] for i in range(num_assets)]
+    # # Assuming no rebalancing, simulate value appreciation over time
+    # for t in range(days - 1):
+    #     baseline_portfolio_val = 0.0
+    #     for k in range(num_assets):
+    #         baseline_portfolio_val += baseline_shares[k] * price_array[t+1][k]
+    #     baseline_value = baseline_portfolio_val
+    # baseline_return = (baseline_value - 1.0) * 100.0
+
+    print("Best simulation metrics:")
+    print(f"  Final portfolio value: {best_metrics['final_portfolio_value']:.4f}")
+    print(f"  Return: {best_metrics['final_return']:.2f}%")
+    print(f"  Annualized Sharpe ratio: {best_metrics['sharpe_ratio']:.4f}")
+    print(f"  Maximum drawdown: {best_metrics['max_drawdown']:.2%}")
+    print()
+    # print(f"Baseline portfolio value: {baseline_value:.4f}")
+    # print(f"  Return: {baseline_return:.2f}%")
+
+    return best_values, best_metrics, all_metrics
+
+
+# In[ ]:
+
+
+def evaluate_baseline(price_array):
     days = price_array.shape[0]
     baseline_value = 1.0
     baseline_weights = [1.0 / num_assets] * num_assets  # equal weights on assets
@@ -767,17 +799,7 @@ def evaluate_policy(price_array, model, initial_state, runs=1):
             baseline_portfolio_val += baseline_shares[k] * price_array[t+1][k]
         baseline_value = baseline_portfolio_val
     baseline_return = (baseline_value - 1.0) * 100.0
-
-    print("Best simulation metrics:")
-    print(f"  Final portfolio value: {best_metrics['final_portfolio_value']:.4f}")
-    print(f"  Return: {best_metrics['final_return']:.2f}%")
-    print(f"  Annualized Sharpe ratio: {best_metrics['sharpe_ratio']:.4f}")
-    print(f"  Maximum drawdown: {best_metrics['max_drawdown']:.2%}")
-    print()
-    print(f"Baseline portfolio value: {baseline_value:.4f}")
-    print(f"  Return: {baseline_return:.2f}%")
-
-    return best_values, best_metrics, baseline_value, baseline_return, all_metrics
+    return baseline_value, baseline_return
 
 
 # In[ ]:
@@ -789,15 +811,16 @@ results = {
     'final_return': 0.0,
     'sharpe_ratio': 0.0,
     'max_drawdown': 0.0,
-    'baseline_value': 0.0,
 }
 for model in models:
     print("Evaluating model...")
-    agent_values, agent_metrics, baseline_value, baseline_return, all_run_metrics = evaluate_policy(test_prices, model, initial_state, 10)
+    agent_values, agent_metrics, all_run_metrics = evaluate_policy(test_prices, model, initial_state, 10)
     if results['final_portfolio_value'] < agent_metrics['final_portfolio_value']:
         results = agent_metrics
     print("Evaluation completed.")
     print()
+
+results['baseline_value'], results['baseline_return'] = evaluate_baseline(test_prices)
 
 print("Final evaluation results:")
 print(f"    Final portfolio value: {results['final_portfolio_value']:.4f}")
@@ -805,12 +828,6 @@ print(f"    Final return: {results['final_return']:.2f}%")
 print(f"    Annualized Sharpe ratio: {results['sharpe_ratio']:.4f}")
 print(f"    Maximum drawdown: {results['max_drawdown']:.2%}")
 print()
-print(f"Baseline portfolio value: {baseline_value:.4f}")
-print(f"  Return: {baseline_return:.2f}%")
-
-
-# In[ ]:
-
-
-
+print(f"Baseline portfolio value: {results['baseline_value']:.4f}")
+print(f"  Return: {results['baseline_return']:.2f}%")
 
